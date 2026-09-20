@@ -8,8 +8,8 @@ index 29990c65..60b1a015 100644
      # these defaults.
 -    'mac_sdk%': '10.5',
 -    'mac_deployment_target%': '10.5',
-+    'mac_sdk%': '10.13',
-+    'mac_deployment_target%': '10.13',
++    'mac_sdk%': '12.0',
++    'mac_deployment_target%': '12.0',
  
      # Set to 1 to enable code coverage.  In addition to build changes
      # (e.g. extra CFLAGS), also creates a new target in the src/chrome
@@ -139,7 +139,7 @@ index ed782c91..b3ccc4e8 100644
  			buildSettings = {
  				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
  				GCC_TREAT_WARNINGS_AS_ERRORS = NO;
-+				MACOSX_DEPLOYMENT_TARGET = 10.13;
++				MACOSX_DEPLOYMENT_TARGET = 12.0;
  				SDKROOT = macosx;
  			};
  			name = Debug;
@@ -147,7 +147,7 @@ index ed782c91..b3ccc4e8 100644
  			buildSettings = {
  				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
  				GCC_TREAT_WARNINGS_AS_ERRORS = NO;
-+				MACOSX_DEPLOYMENT_TARGET = 10.13;
++				MACOSX_DEPLOYMENT_TARGET = 12.0;
  			};
  			name = Release;
  		};
@@ -155,7 +155,7 @@ index ed782c91..b3ccc4e8 100644
  			buildSettings = {
  				CLANG_CXX_LANGUAGE_STANDARD = "c++17";
  				GCC_TREAT_WARNINGS_AS_ERRORS = NO;
-+				MACOSX_DEPLOYMENT_TARGET = 10.13;
++				MACOSX_DEPLOYMENT_TARGET = 12.0;
  			};
  			name = "Debug With Code Coverage";
  		};
