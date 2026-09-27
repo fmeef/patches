@@ -1,0 +1,362 @@
+diff --git a/libheif/codecs/hevc_boxes.cc b/libheif/codecs/hevc_boxes.cc
+index 1658ac15..505bcd3e 100644
+--- a/libheif/codecs/hevc_boxes.cc
++++ b/libheif/codecs/hevc_boxes.cc
+@@ -615,6 +615,12 @@ Error parse_sps_for_hvcC_configuration(const uint8_t* sps, size_t size,
+   reader.skip_bits(4);
+ 
+   uint8_t nMaxSubLayersMinus1 = reader.get_bits8(3);
++  if (nMaxSubLayersMinus1 > 6) {
++    // sps_max_sub_layers_minus1 is in the range 0..6 (H.265 section 7.4.3.2.1).
++    return Error{heif_error_Invalid_input,
++                 heif_suberror_Invalid_parameter_value,
++                 "SPS sps_max_sub_layers_minus1 out of range"};
++  }
+ 
+   config->temporal_id_nested = reader.get_bits8(1);
+ 
+@@ -647,9 +653,13 @@ Error parse_sps_for_hvcC_configuration(const uint8_t* sps, size_t size,
+ 
+   for (int i = 0; i < nMaxSubLayersMinus1; i++) {
+     if (layer_profile_present[i]) {
++      // Same 88 bits as the general profile above: space, tier, idc,
++      // compatibility flags, then 48 bits of source and constraint flags.
+       reader.skip_bits(2 + 1 + 5);
+       reader.skip_bits(32);
+       reader.skip_bits(16);
++      reader.skip_bits(16);
++      reader.skip_bits(16);
+     }
+ 
+     if (layer_level_present[i]) {
+@@ -666,9 +676,17 @@ Error parse_sps_for_hvcC_configuration(const uint8_t* sps, size_t size,
+     "Invalid variable length code in HEVC SPS header"
+   };
+ 
+-  uint32_t dummy, value;
+-  if (!reader.get_uvlc(&dummy) || // skip seq_parameter_seq_id
+-      !reader.get_uvlc(&value)) {
++  uint32_t value;
++  if (!reader.get_uvlc(&value)) {
++    return invalidUVLC;
++  }
++  if (value > 15) {
++    return Error{heif_error_Invalid_input,
++                 heif_suberror_Invalid_parameter_value,
++                 "SPS seq_parameter_set_id out of range"};
++  }
++
++  if (!reader.get_uvlc(&value)) {
+     return invalidUVLC;
+   }
+   if (value > 3) {
+@@ -688,6 +706,11 @@ Error parse_sps_for_hvcC_configuration(const uint8_t* sps, size_t size,
+       !reader.get_uvlc(height)) {
+     return invalidUVLC;
+   }
++  if (*width == 0 || *height == 0 || *width > 65535 || *height > 65535) {
++    return Error{heif_error_Invalid_input,
++                 heif_suberror_Invalid_parameter_value,
++                 "SPS picture size out of range"};
++  }
+ 
+   if (coded_size) {
+     coded_size->width = *width;
+@@ -715,7 +738,7 @@ Error parse_sps_for_hvcC_configuration(const uint8_t* sps, size_t size,
+ 
+     const uint64_t crop_w = (uint64_t)subH * ((uint64_t)left + (uint64_t)right);
+     const uint64_t crop_h = (uint64_t)subV * ((uint64_t)top + (uint64_t)bottom);
+-    if (crop_w > *width || crop_h > *height) {
++    if (crop_w >= *width || crop_h >= *height) {
+       return Error{heif_error_Invalid_input,
+                    heif_suberror_Invalid_parameter_value,
+                    "SPS conformance window exceeds image dimensions"};
+@@ -744,6 +767,13 @@ Error parse_sps_for_hvcC_configuration(const uint8_t* sps, size_t size,
+   }
+   config->bit_depth_chroma = (uint8_t) (value + 8);
+ 
++  if (reader.get_bits_remaining() < 0) {
++    // The reader returns zeros past the end, so a truncated SPS would
++    // otherwise parse with made-up values.
++    return Error{heif_error_Invalid_input,
++                 heif_suberror_End_of_data,
++                 "SPS header is truncated"};
++  }
+ 
+ 
+   // --- init static configuration fields ---
+diff --git a/libheif/codecs/hevc_dec.cc b/libheif/codecs/hevc_dec.cc
+index d7458b42..ca56bd98 100644
+--- a/libheif/codecs/hevc_dec.cc
++++ b/libheif/codecs/hevc_dec.cc
+@@ -82,9 +82,9 @@ Result<std::optional<ImageSize>> Decoder_HEVC::get_max_coded_image_size(const st
+     Error e = parse_sps_for_hvcC_configuration(nal_data, nal_size, &scratch,
+                                                &cropped_w, &cropped_h, &coded);
+     if (e) {
+-      // A malformed SPS we cannot parse is skipped rather than failing the whole
+-      // decode; the decoder plugin applies its own limits when it reaches it.
+-      continue;
++      // An SPS we cannot parse has an unknown coded size, so it must not reach the
++      // decoder plugin: not every plugin enforces the size limits before allocating.
++      return e;
+     }
+ 
+     found = true;
+@@ -93,6 +93,8 @@ Result<std::optional<ImageSize>> Decoder_HEVC::get_max_coded_image_size(const st
+   }
+ 
+   if (!found) {
++    // Later samples of a sequence reuse the parameter sets of earlier ones, and
++    // those were already checked when they were pushed.
+     return std::optional<ImageSize>{};
+   }
+ 
+diff --git a/libheif/plugins/decoder_ffmpeg.cc b/libheif/plugins/decoder_ffmpeg.cc
+index 27fcac48..4cdcbdcf 100644
+--- a/libheif/plugins/decoder_ffmpeg.cc
++++ b/libheif/plugins/decoder_ffmpeg.cc
+@@ -31,6 +31,7 @@
+ 
+ #include <deque>
+ #include <iostream>
++#include <limits>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+@@ -63,14 +64,12 @@ struct ffmpeg_decoder
+   // --- decoder
+ 
+   const AVCodec* av_codec = NULL;
+-  AVCodecParserContext* av_codec_parser_context = NULL;
+   AVCodecContext* av_codec_context = NULL;
+ 
+   std::string error_message;
+ 
+   ~ffmpeg_decoder()
+   {
+-    if (av_codec_parser_context) av_parser_close(av_codec_parser_context);
+     if (av_codec_context) avcodec_free_context(&av_codec_context);
+   }
+ };
+@@ -80,6 +79,20 @@ static bool supportsNal(AVCodecID id) {
+   return id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_H265 || id == AV_CODEC_ID_H266;
+ }
+ 
++// Emulation prevention keeps 00 00 00, 00 00 01 and 00 00 02 out of every valid
++// NAL unit. The NAL units are handed to FFmpeg with start codes, so such a byte
++// sequence would make FFmpeg split the data differently than libheif did when it
++// checked the parameter sets.
++static bool contains_start_code_prefix(const uint8_t* data, size_t size)
++{
++  for (size_t i = 2; i < size; i++) {
++    if (data[i] <= 2 && data[i - 1] == 0 && data[i - 2] == 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ // Codecs whose bitstream carries CICP colour signalling (VUI / sequence header).
+ static bool codec_has_cicp_signalling(AVCodecID id)
+ {
+@@ -116,6 +129,12 @@ static void ffmpeg_deinit_plugin()
+ 
+ static int ffmpeg_does_support_format(heif_compression_format format)
+ {
++  // Telegram Desktop: only HEVC goes through FFmpeg here, as it went through
++  // libde265 before, so no other decoder is reachable from HEIF files.
++  if (format != heif_compression_HEVC) {
++    return 0;
++  }
++
+   switch(format) {
+   case heif_compression_HEVC:
+     return avcodec_find_decoder(AV_CODEC_ID_HEVC) ? FFMPEG_DECODER_PLUGIN_PRIORITY : 0;
+@@ -187,16 +206,24 @@ static heif_error ffmpeg_new_decoder2(void** dec, const heif_decoder_plugin_opti
+     return { heif_error_Decoder_plugin_error, heif_suberror_Unspecified, "avcodec_find_decoder() returned error" };
+   }
+ 
+-  decoder->av_codec_parser_context = av_parser_init(decoder->av_codec->id);
+-  if (!decoder->av_codec_parser_context) {
+-    return { heif_error_Decoder_plugin_error, heif_suberror_Unspecified, "av_parser_init returned error" };
+-  }
+-
+   decoder->av_codec_context = avcodec_alloc_context3(decoder->av_codec);
+   if (!decoder->av_codec_context) {
+     return { heif_error_Memory_allocation_error, heif_suberror_Unspecified, "avcodec_alloc_context3 returned error" };
+   }
+ 
++  // Crop exactly as the bitstream signals. Otherwise FFmpeg rounds a left crop
++  // down to keep the plane pointers aligned, and the decoded image comes out
++  // wider than the size signaled in the file.
++  decoder->av_codec_context->flags |= AV_CODEC_FLAG_UNALIGNED;
++
++  // Let FFmpeg refuse pictures larger than libheif's limit for this image
++  // (ispe plus a coding-unit margin), as the libde265 plugin does.
++  const heif_security_limits* limits = options->limits ? options->limits : heif_get_global_security_limits();
++  if (limits->max_image_size_pixels > 0 &&
++      limits->max_image_size_pixels <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
++    decoder->av_codec_context->max_pixels = static_cast<int64_t>(limits->max_image_size_pixels);
++  }
++
+   /* open it */
+   if (avcodec_open2(decoder->av_codec_context, decoder->av_codec, NULL) < 0) {
+     return { heif_error_Decoder_plugin_error, heif_suberror_Unspecified, "avcodec_open2 returned error" };
+@@ -323,6 +350,14 @@ static heif_error ffmpeg_push_data2(void *decoder_raw, const void *data, size_t
+         };
+       }
+ 
++      if (contains_start_code_prefix(cdata + ptr, nal_size)) {
++        return {
++          heif_error_Decoder_plugin_error,
++          heif_suberror_Unspecified,
++          "NAL unit contains a start code prefix"
++        };
++      }
++
+       pkt.data.push_back(0);
+       pkt.data.push_back(0);
+       pkt.data.push_back(1);
+@@ -354,6 +389,7 @@ static heif_error ffmpeg_push_data(void *decoder_raw, const void *data, size_t s
+ static heif_chroma ffmpeg_get_chroma_format(AVPixelFormat pix_fmt) {
+   switch (pix_fmt) {
+     case AV_PIX_FMT_GRAY8:
++    case AV_PIX_FMT_GRAY9:
+     case AV_PIX_FMT_GRAY10:
+     case AV_PIX_FMT_GRAY12:
+     case AV_PIX_FMT_GRAY14:
+@@ -362,6 +398,7 @@ static heif_chroma ffmpeg_get_chroma_format(AVPixelFormat pix_fmt) {
+ 
+     case AV_PIX_FMT_YUV420P:
+     case AV_PIX_FMT_YUVJ420P:
++    case AV_PIX_FMT_YUV420P9:
+     case AV_PIX_FMT_YUV420P10:
+     case AV_PIX_FMT_YUV420P12:
+     case AV_PIX_FMT_YUV420P14:
+@@ -369,6 +406,7 @@ static heif_chroma ffmpeg_get_chroma_format(AVPixelFormat pix_fmt) {
+       return heif_chroma_420;
+ 
+     case AV_PIX_FMT_YUV422P:
++    case AV_PIX_FMT_YUV422P9:
+     case AV_PIX_FMT_YUV422P10:
+     case AV_PIX_FMT_YUV422P12:
+     case AV_PIX_FMT_YUV422P14:
+@@ -376,12 +414,22 @@ static heif_chroma ffmpeg_get_chroma_format(AVPixelFormat pix_fmt) {
+       return heif_chroma_422;
+ 
+     case AV_PIX_FMT_YUV444P:
++    case AV_PIX_FMT_YUV444P9:
+     case AV_PIX_FMT_YUV444P10:
+     case AV_PIX_FMT_YUV444P12:
+     case AV_PIX_FMT_YUV444P14:
+     case AV_PIX_FMT_YUV444P16:
+       return heif_chroma_444;
+ 
++    // FFmpeg's HEVC decoder outputs planar GBR for 4:4:4 streams signaling
++    // matrix_coefficients 0. Its G, B, R planes map onto Y, Cb, Cr, which is
++    // exactly how libheif stores images with the identity matrix.
++    case AV_PIX_FMT_GBRP:
++    case AV_PIX_FMT_GBRP9:
++    case AV_PIX_FMT_GBRP10:
++    case AV_PIX_FMT_GBRP12:
++      return heif_chroma_444;
++
+     default:
+       // Unsupported pix_fmt
+       return heif_chroma_undefined;
+@@ -428,16 +476,25 @@ static int get_ffmpeg_format_bpp(AVPixelFormat pix_fmt)
+     case AV_PIX_FMT_YUVJ420P:
+     case AV_PIX_FMT_YUV422P:
+     case AV_PIX_FMT_YUV444P:
++    case AV_PIX_FMT_GBRP:
+       return 8;
++    case AV_PIX_FMT_GRAY9:
++    case AV_PIX_FMT_YUV420P9:
++    case AV_PIX_FMT_YUV422P9:
++    case AV_PIX_FMT_YUV444P9:
++    case AV_PIX_FMT_GBRP9:
++      return 9;
+     case AV_PIX_FMT_GRAY10:
+     case AV_PIX_FMT_YUV420P10:
+     case AV_PIX_FMT_YUV422P10:
+     case AV_PIX_FMT_YUV444P10:
++    case AV_PIX_FMT_GBRP10:
+       return 10;
+     case AV_PIX_FMT_GRAY12:
+     case AV_PIX_FMT_YUV420P12:
+     case AV_PIX_FMT_YUV422P12:
+     case AV_PIX_FMT_YUV444P12:
++    case AV_PIX_FMT_GBRP12:
+       return 12;
+     case AV_PIX_FMT_GRAY14:
+     case AV_PIX_FMT_YUV420P14:
+@@ -715,9 +772,6 @@ static heif_error ffmpeg_decode_next_image2(void* decoder_raw,
+   heif_error err = kSuccess;
+ 
+   if (!decoder->input_data.empty()) {
+-    uint8_t* parse_av_data = NULL;
+-    int parse_av_data_size = 0;
+-
+     ffmpeg_decoder::Packet& first_pkt = decoder->input_data.front();
+ 
+     if (first_pkt.data.empty()) {
+@@ -737,49 +791,17 @@ static heif_error ffmpeg_decode_next_image2(void* decoder_raw,
+         return { heif_error_Memory_allocation_error, heif_suberror_Unspecified, "av_packet_alloc returned error" };
+       }
+ 
+-      parse_av_data = first_pkt.data.data();
+-      parse_av_data_size = (int) first_pkt.data.size();
+-      size_t n_bytes_consumed = 0;
+-
+-      while (parse_av_data_size > 0) {
+-        decoder->av_codec_parser_context->flags = PARSER_FLAG_COMPLETE_FRAMES;
+-        ret = av_parser_parse2(decoder->av_codec_parser_context, decoder->av_codec_context, &av_pkt->data, &av_pkt->size,
+-                               parse_av_data, parse_av_data_size,
+-                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+-        if (ret < 0) {
+-          return {heif_error_Decoder_plugin_error, heif_suberror_Unspecified, "av_parser_parse2 returned error"};
+-        }
+-
+-        // std::cout << "decode packet of size: " << ret << "\n";
+-
+-        parse_av_data += ret;
+-        parse_av_data_size -= ret;
+-        n_bytes_consumed += ret;
+-
+-        if (av_pkt->size) {
+-          av_pkt->pts = first_pkt.user_data;
+-
+-          ret = avcodec_send_packet(decoder->av_codec_context, av_pkt);
+-          if (ret < 0) {
+-            char buf[100];
+-            av_make_error_string(buf, 100, ret);
+-            return {heif_error_Decoder_plugin_error, heif_suberror_Unspecified, "Error in avcodec_send_packet"};
+-          }
+-        }
+-        else {
+-          break;
+-        }
+-      }
++      // Every pushed chunk is a complete access unit, so it goes to the decoder
++      // as one packet. Running av_parser_parse2() over it first only parsed all
++      // NAL units a second time before the decoder parsed them again.
++      av_pkt->data = first_pkt.data.data();
++      av_pkt->size = (int) first_pkt.data.size();
++      av_pkt->pts = first_pkt.user_data;
+ 
+-      if (n_bytes_consumed == first_pkt.data.size()) {
+-        decoder->input_data.pop_front();
+-      }
+-      else {
+-        if (n_bytes_consumed > 0) {
+-          memmove(first_pkt.data.data(), first_pkt.data.data() + n_bytes_consumed,
+-                  first_pkt.data.size() - n_bytes_consumed);
+-          decoder->input_data.resize(decoder->input_data.size() - n_bytes_consumed);
+-        }
++      ret = avcodec_send_packet(decoder->av_codec_context, av_pkt);
++      decoder->input_data.pop_front();
++      if (ret < 0) {
++        return {heif_error_Decoder_plugin_error, heif_suberror_Unspecified, "Error in avcodec_send_packet"};
+       }
+     }
+   }
